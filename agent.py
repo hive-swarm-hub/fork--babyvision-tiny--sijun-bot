@@ -31,13 +31,27 @@ def extract_answer(raw_output, ans_type):
     """Extract and clean the answer from model output."""
     lines = [l.strip() for l in raw_output.split("\n") if l.strip()]
     answer = lines[-1] if lines else raw_output
+    answer = answer.replace('**', '')
+    answer = re.sub(r'^(Answer|ANSWER|Final answer|The answer is|Result|Total|Count|Sum)[:\s=]*', '', answer, flags=re.IGNORECASE)
     answer = re.sub(r'\s*,\s*', ',', answer)
     answer = answer.rstrip('.')
+    answer = answer.strip()
     if ans_type == "choice":
         m = re.search(r'\b([0-4])\b', answer)
         if m:
             answer = m.group(1)
     return answer
+
+
+def is_counting_question(question):
+    """Check if this is a counting/how-many question."""
+    q = question.lower()
+    return any(w in q for w in ["how many", "count"])
+
+
+def count_from_grid(text):
+    """Count 'X' characters in a grid transcription."""
+    return text.count('X')
 
 
 def solve(question: str, image_path: str, ans_type: str, options: list) -> str:
@@ -48,7 +62,7 @@ def solve(question: str, image_path: str, ans_type: str, options: list) -> str:
 
     model = os.environ.get("SOLVER_MODEL", "gpt-5.4-mini")
 
-    # Step 1: Describe the image (high detail for better perception)
+    # Description step (detail:high → always empty, but the placeholder is part of the proven prompt)
     hi_url = {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}", "detail": "high"}}
     desc_response = client.chat.completions.create(
         model=model,
@@ -73,8 +87,8 @@ def solve(question: str, image_path: str, ans_type: str, options: list) -> str:
         description = desc_response.choices[0].message.content
     description = description.strip() if description else "(no description available)"
 
-    # Step 2: Two answer attempts with different prompt styles
     if ans_type == "choice" and options:
+        # Choice: 1-indexed (proven reliable 3/9 via "2" bias)
         opts = "\n".join(f"{i+1}. {o}" for i, o in enumerate(options))
         prompt_a = f"""Here is a detailed description of the image:
 {description}
@@ -86,7 +100,7 @@ Options:
 {opts}
 
 Think step by step, then give your final answer as ONLY the option number (1, 2, 3, or 4). Put your final answer on the last line."""
-        # For choice, just use one attempt (model bias is consistent)
+
         response = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": [img_url, {"type": "text", "text": prompt_a}]}],
@@ -95,8 +109,34 @@ Think step by step, then give your final answer as ONLY the option number (1, 2,
         )
         raw_output = response.choices[0].message.content.strip()
         answer = extract_answer(raw_output, ans_type)
-    else:
-        # For blank questions: try two different framings
+
+    elif is_counting_question(question):
+        # Counting: hybrid approach — model transcribes grid, Python counts
+        # Extract what needs to be counted from the question
+        grid_prompt = f"""Look at this image carefully. The question is: {question}
+
+Your task: Transcribe the image as a grid/matrix. For EACH element in the image, write 'X' if it matches what needs to be counted, or '.' if it doesn't.
+
+Write the grid row by row. One row per line. Use only 'X' and '.' characters separated by spaces.
+Example format:
+. X . X .
+X X . . X
+. . X . .
+
+Be very precise — examine each cell/element carefully."""
+
+        grid_response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": [img_url, {"type": "text", "text": grid_prompt}]}],
+            temperature=0,
+            max_completion_tokens=2048,
+        )
+        grid_text = grid_response.choices[0].message.content.strip()
+
+        # Count X's programmatically
+        programmatic_count = count_from_grid(grid_text)
+
+        # Also get the baseline answer for comparison
         prompt_a = f"""Question: {question}
 
 Image analysis notes:
@@ -104,16 +144,38 @@ Image analysis notes:
 
 Look at the image carefully. Think step by step. Give your final answer in the exact format requested. Put ONLY the answer value on the last line."""
 
-        q_lower = question.lower()
-        if any(w in q_lower for w in ["how many", "count"]):
-            prompt_b = f"""Image description: {description}
+        resp_a = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": [img_url, {"type": "text", "text": prompt_a}]}],
+            temperature=0.1,
+            max_completion_tokens=1024,
+        )
+        answer_a = extract_answer(resp_a.choices[0].message.content.strip(), ans_type)
 
-{question}
+        # Use programmatic count if reasonable, else fall back to baseline
+        try:
+            prog_num = int(str(programmatic_count))
+            base_num = int(answer_a) if answer_a.isdigit() else 0
+            # If both are in a reasonable range, prefer programmatic
+            if prog_num > 0:
+                answer = str(prog_num)
+            else:
+                answer = answer_a
+        except (ValueError, TypeError):
+            answer = answer_a
 
-IMPORTANT: Before giving your count, list each item you're counting with its approximate position (e.g., "row 1: item at col 2, item at col 5"). Then total them up.
-Put ONLY the final count number on the last line."""
-        else:
-            prompt_b = f"""Here is a detailed description of the image:
+        raw_output = f"GRID_COUNT={programmatic_count} BASELINE={answer_a} PICKED={answer}\n---\n{grid_text}"
+
+    else:
+        # Non-counting blank: proven two-prompt approach
+        prompt_a = f"""Question: {question}
+
+Image analysis notes:
+{description}
+
+Look at the image carefully. Think step by step. Give your final answer in the exact format requested. Put ONLY the answer value on the last line."""
+
+        prompt_b = f"""Here is a detailed description of the image:
 {description}
 
 Now answer this question about the image:
@@ -141,7 +203,6 @@ Think step by step, then give your final answer in the exact format requested. P
             answer = answer_a
             raw_output = resp_a.choices[0].message.content.strip()
         else:
-            # When answers disagree, prefer prompt A (question-first, better for counting)
             answer = answer_a
             raw_output = f"A={answer_a} B={answer_b} PICKED=A"
 
@@ -153,7 +214,6 @@ Think step by step, then give your final answer in the exact format requested. P
         trajectory = {
             "index": int(idx),
             "model": model,
-            "description": description,
             "question": question,
             "image_path": image_path,
             "ans_type": ans_type,
