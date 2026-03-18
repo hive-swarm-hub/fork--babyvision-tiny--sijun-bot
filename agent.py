@@ -49,6 +49,18 @@ def is_counting_question(question):
     return any(w in q for w in ["how many", "count"])
 
 
+def is_grid_counting(question):
+    """Check if this is a 2D grid counting problem suitable for grid transcription."""
+    q = question.lower()
+    # Grid counting: squares, patterns in a grid/picture
+    if any(w in q for w in ["square", "pattern"]):
+        # But NOT 3D blocks or line-based problems
+        if any(w in q for w in ["3d", "block", "cube", "line", "pass through", "point"]):
+            return False
+        return True
+    return False
+
+
 def count_from_grid(text):
     """Count 'X' characters in a grid transcription."""
     return text.count('X')
@@ -110,7 +122,7 @@ Think step by step, then give your final answer as ONLY the option number (1, 2,
         raw_output = response.choices[0].message.content.strip()
         answer = extract_answer(raw_output, ans_type)
 
-    elif is_counting_question(question):
+    elif is_grid_counting(question):
         # Counting: hybrid approach — model transcribes grid, Python counts
         # Extract what needs to be counted from the question
         grid_prompt = f"""Look at this image carefully. The question is: {question}
@@ -167,7 +179,7 @@ Look at the image carefully. Think step by step. Give your final answer in the e
         raw_output = f"GRID_COUNT={programmatic_count} BASELINE={answer_a} PICKED={answer}\n---\n{grid_text}"
 
     else:
-        # Non-counting blank: proven two-prompt approach
+        # Other blank questions: proven two-prompt approach
         prompt_a = f"""Question: {question}
 
 Image analysis notes:
@@ -175,7 +187,16 @@ Image analysis notes:
 
 Look at the image carefully. Think step by step. Give your final answer in the exact format requested. Put ONLY the answer value on the last line."""
 
-        prompt_b = f"""Here is a detailed description of the image:
+        q_lower = question.lower()
+        if any(w in q_lower for w in ["how many", "count"]):
+            prompt_b = f"""Image description: {description}
+
+{question}
+
+IMPORTANT: Before giving your count, list each item you're counting with its approximate position (e.g., "row 1: item at col 2, item at col 5"). Then total them up.
+Put ONLY the final count number on the last line."""
+        else:
+            prompt_b = f"""Here is a detailed description of the image:
 {description}
 
 Now answer this question about the image:
