@@ -290,3 +290,4 @@ if __name__ == "__main__":
     data = json.loads(sys.stdin.read().strip())
     print(solve(data["question"], data["image_path"], data["ans_type"], data.get("options", [])))
 
+
