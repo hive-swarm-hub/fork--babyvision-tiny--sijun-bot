@@ -182,6 +182,55 @@ Look at the image carefully. Think step by step. Give your final answer in the e
 
         raw_output = f"GRID_COUNT={programmatic_count} BASELINE={answer_a} PICKED={answer}\n---\n{grid_text}"
 
+    elif is_counting_question(question):
+        # Non-grid counting: enumerate-then-count approach
+        enum_prompt = f"""{question}
+
+IMPORTANT: Do NOT just give a number. Instead, LIST each item you are counting, one per line, with its position/description.
+Format each line as: "N. [description of item and its location]"
+where N is the running number.
+After listing ALL items, write "Total: [number]" on the last line.
+Be very thorough — examine every part of the image carefully."""
+
+        enum_response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": [img_url, {"type": "text", "text": enum_prompt}]}],
+            temperature=0,
+            max_completion_tokens=2048,
+        )
+        enum_text = enum_response.choices[0].message.content.strip()
+
+        # Count enumerated items by finding numbered lines
+        numbered_lines = re.findall(r'^\s*(\d+)\.\s', enum_text, re.MULTILINE)
+        if numbered_lines:
+            enum_count = max(int(n) for n in numbered_lines)
+        else:
+            enum_count = 0
+
+        # Also get the baseline answer
+        prompt_a = f"""Question: {question}
+
+Image analysis notes:
+{description}
+
+Look at the image carefully. Think step by step. Give your final answer in the exact format requested. Put ONLY the answer value on the last line."""
+
+        resp_a = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": [img_url, {"type": "text", "text": prompt_a}]}],
+            temperature=0.1,
+            max_completion_tokens=1024,
+        )
+        answer_a = extract_answer(resp_a.choices[0].message.content.strip(), ans_type)
+
+        # Use enumeration count if reasonable, else baseline
+        if enum_count > 0:
+            answer = str(enum_count)
+        else:
+            answer = answer_a
+
+        raw_output = f"ENUM_COUNT={enum_count} BASELINE={answer_a} PICKED={answer}\n---\n{enum_text}"
+
     else:
         # Other blank questions: proven two-prompt approach
         prompt_a = f"""Question: {question}
