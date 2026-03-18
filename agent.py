@@ -65,6 +65,7 @@ def api_call(client, model, messages, temperature=0, max_tokens=1024):
         resp = client.chat.completions.create(
             model=model, messages=messages,
             temperature=temperature, max_completion_tokens=max_tokens,
+            seed=42,
         )
         content = resp.choices[0].message.content
         if content and content.strip():
@@ -186,6 +187,7 @@ Be very precise — examine each cell/element carefully."""
             for _ in range(3):
                 resp = client.chat.completions.create(
                     model=model, messages=count_msgs, temperature=0.3, max_completion_tokens=256,
+                    seed=42,
                 )
                 all_answers.append(extract_answer(resp.choices[0].message.content.strip(), ans_type))
 
@@ -195,6 +197,7 @@ Be very precise — examine each cell/element carefully."""
                 messages=[{"role": "user", "content": [hi_url, {"type": "text", "text": prompt_a}]}],
                 temperature=0.1,
                 max_completion_tokens=1024,
+                seed=42,
             )
             all_answers.append(extract_answer(resp_a.choices[0].message.content.strip(), ans_type))
 
@@ -209,6 +212,7 @@ Put ONLY the final count number on the last line."""
                 messages=[{"role": "user", "content": [hi_url, {"type": "text", "text": prompt_count}]}],
                 temperature=0.1,
                 max_completion_tokens=1024,
+                seed=42,
             )
             all_answers.append(extract_answer(resp_b.choices[0].message.content.strip(), ans_type))
 
@@ -230,6 +234,7 @@ Think step by step, then give your final answer in the exact format requested. P
                 messages=[{"role": "user", "content": [hi_url, {"type": "text", "text": prompt_a}]}],
                 temperature=0.1,
                 max_completion_tokens=1024,
+                seed=42,
             )
             answer_a = extract_answer(resp_a.choices[0].message.content.strip(), ans_type)
 
@@ -238,6 +243,7 @@ Think step by step, then give your final answer in the exact format requested. P
                 messages=[{"role": "user", "content": [hi_url, {"type": "text", "text": prompt_b}]}],
                 temperature=0.1,
                 max_completion_tokens=1024,
+                seed=42,
             )
             answer_b = extract_answer(resp_b.choices[0].message.content.strip(), ans_type)
 
