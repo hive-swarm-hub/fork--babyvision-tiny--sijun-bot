@@ -50,9 +50,13 @@ def is_counting_question(question):
 
 
 def is_grid_counting(question):
-    """Check if this is a 2D grid counting problem suitable for grid transcription."""
+    """Check if this is a 2D grid counting problem suitable for grid transcription.
+    Must be a counting question about discrete elements in a 2D grid."""
     q = question.lower()
-    # Grid counting: squares, patterns in a grid/picture
+    # Must be a counting question first
+    if not any(w in q for w in ["how many", "count"]):
+        return False
+    # Must be about grid-like elements (squares, patterns in a picture)
     if any(w in q for w in ["square", "pattern"]):
         # But NOT 3D blocks or line-based problems
         if any(w in q for w in ["3d", "block", "cube", "line", "pass through", "point"]):
