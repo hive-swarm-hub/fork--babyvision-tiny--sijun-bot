@@ -10,6 +10,7 @@ import json
 import base64
 import re
 import io
+from collections import Counter
 
 from openai import OpenAI
 from PIL import Image
@@ -31,11 +32,8 @@ def extract_answer(raw_output, ans_type):
     """Extract and clean the answer from model output."""
     lines = [l.strip() for l in raw_output.split("\n") if l.strip()]
     answer = lines[-1] if lines else raw_output
-    answer = answer.replace('**', '')
-    answer = re.sub(r'^(Answer|ANSWER|Final answer|The answer is|Result|Total|Count|Sum)[:\s=]*', '', answer, flags=re.IGNORECASE)
     answer = re.sub(r'\s*,\s*', ',', answer)
     answer = answer.rstrip('.')
-    answer = answer.strip()
     if ans_type == "choice":
         m = re.search(r'\b([0-4])\b', answer)
         if m:
@@ -43,31 +41,35 @@ def extract_answer(raw_output, ans_type):
     return answer
 
 
-def is_counting_question(question):
-    """Check if this is a counting/how-many question."""
-    q = question.lower()
-    return any(w in q for w in ["how many", "count"])
+def extract_choice_letter(raw_output):
+    """Extract choice answer: letter -> 0-indexed."""
+    lines = [l.strip() for l in raw_output.split("\n") if l.strip()]
+    answer_line = lines[-1] if lines else raw_output
+    letter_map = {'A': '0', 'B': '1', 'C': '2', 'D': '3'}
+    m = re.search(r'\b([A-D])\b', answer_line)
+    if m and m.group(1) in letter_map:
+        return letter_map[m.group(1)]
+    m = re.search(r'\b([0-3])\b', answer_line)
+    if m:
+        return m.group(1)
+    for line in reversed(lines):
+        m = re.search(r'\b([A-D])\b', line)
+        if m and m.group(1) in letter_map:
+            return letter_map[m.group(1)]
+    return answer_line
 
 
-def is_grid_counting(question):
-    """Check if this is a 2D grid counting problem suitable for grid transcription.
-    Must be a counting question about discrete elements in a 2D grid."""
-    q = question.lower()
-    # Must be a counting question first
-    if not any(w in q for w in ["how many", "count"]):
-        return False
-    # Must be about grid-like elements (squares, patterns in a picture)
-    if any(w in q for w in ["square", "pattern"]):
-        # But NOT 3D blocks or line-based problems
-        if any(w in q for w in ["3d", "block", "cube", "line", "pass through", "point"]):
-            return False
-        return True
-    return False
-
-
-def count_from_grid(text):
-    """Count 'X' characters in a grid transcription."""
-    return text.count('X')
+def api_call(client, model, messages, temperature=0, max_tokens=1024):
+    """API call with retry on empty."""
+    for _ in range(2):
+        resp = client.chat.completions.create(
+            model=model, messages=messages,
+            temperature=temperature, max_completion_tokens=max_tokens,
+        )
+        content = resp.choices[0].message.content
+        if content and content.strip():
+            return content.strip()
+    return ""
 
 
 def solve(question: str, image_path: str, ans_type: str, options: list) -> str:
@@ -75,61 +77,70 @@ def solve(question: str, image_path: str, ans_type: str, options: list) -> str:
 
     img_b64 = load_image_b64(image_path)
     img_url = {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
+    hi_url = {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}", "detail": "high"}}
 
     model = os.environ.get("SOLVER_MODEL", "gpt-5.4-mini")
 
-    # Description step (detail:high → always empty, but the placeholder is part of the proven prompt)
-    hi_url = {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}", "detail": "high"}}
-    desc_response = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": [
-            hi_url,
-            {"type": "text", "text": "Describe this image in detail. Focus on: the layout/grid structure, all visual elements (shapes, colors, patterns, numbers, letters), positions of elements, any differences or similarities between elements, and any spatial relationships. Be thorough and precise."},
-        ]}],
-        temperature=0,
-        max_completion_tokens=512,
-    )
-    description = desc_response.choices[0].message.content
-    if not description or not description.strip():
-        desc_response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": [
-                hi_url,
-                {"type": "text", "text": "Describe this image in detail. Focus on layout, elements, positions, differences."},
-            ]}],
-            temperature=0,
-            max_completion_tokens=300,
-        )
-        description = desc_response.choices[0].message.content
-    description = description.strip() if description else "(no description available)"
+    # Step 1: Description (returns empty with detail:high + 512 tokens, acts as conversation seed)
+    desc_messages = [{"role": "user", "content": [
+        hi_url,
+        {"type": "text", "text": "Describe this image in detail. Focus on: the layout/grid structure, all visual elements (shapes, colors, patterns, numbers, letters), positions of elements, any differences or similarities between elements, and any spatial relationships. Be thorough and precise."},
+    ]}]
+    description = api_call(client, model, desc_messages, temperature=0, max_tokens=512)
+    if not description:
+        description = "(no description available)"
 
     if ans_type == "choice" and options:
-        # Choice: 1-indexed (proven reliable 3/9 via "2" bias)
-        opts = "\n".join(f"{i+1}. {o}" for i, o in enumerate(options))
-        prompt_a = f"""Here is a detailed description of the image:
-{description}
+        # Choice: multi-turn with letter-based answers (junjie's approach)
+        n = len(options)
+        labels = ['A', 'B', 'C', 'D'][:n]
+        all_letters = all(len(o) == 1 and o in 'ABCD' for o in options)
 
-Now answer this question about the image:
+        messages = list(desc_messages)
+        messages.append({"role": "assistant", "content": description})
+
+        if all_letters:
+            answer_prompt = f"""Now answer this question about the image:
+{question}
+
+The options are shown in the image as {', '.join(labels)}.
+
+First, describe what you see in EACH option ({', '.join(labels)}) separately and in detail.
+Then, explain step by step which option is correct and why, comparing each option against the requirements.
+Finally, give your final answer as ONLY a single letter ({', '.join(labels)}) on the last line."""
+        else:
+            opts = "\n".join(f"{labels[i]}. {o}" for i, o in enumerate(options))
+            answer_prompt = f"""Now answer this question about the image:
 {question}
 
 Options:
 {opts}
 
-Think step by step, then give your final answer as ONLY the option number (1, 2, 3, or 4). Put your final answer on the last line."""
+First, describe what you see for each option in detail.
+Then, explain step by step which option is correct and why.
+Finally, give your final answer as ONLY a single letter ({', '.join(labels)}) on the last line."""
 
-        response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": [img_url, {"type": "text", "text": prompt_a}]}],
-            temperature=0,
-            max_completion_tokens=1024,
-        )
-        raw_output = response.choices[0].message.content.strip()
-        answer = extract_answer(raw_output, ans_type)
+        messages.append({"role": "user", "content": [img_url, {"type": "text", "text": answer_prompt}]})
+        raw_output = api_call(client, model, messages, temperature=0, max_tokens=1500)
+        answer = extract_choice_letter(raw_output)
 
-    elif is_grid_counting(question):
-        # Counting: hybrid approach — model transcribes grid, Python counts
-        # Extract what needs to be counted from the question
-        grid_prompt = f"""Look at this image carefully. The question is: {question}
+    else:
+        # Blank questions
+        prompt_a = f"""Question: {question}
+
+Image analysis notes:
+{description}
+
+Look at the image carefully. Think step by step. Give your final answer in the exact format requested. Put ONLY the answer value on the last line."""
+
+        q_lower = question.lower()
+        is_counting = any(w in q_lower for w in ["how many", "count"])
+        # Grid counting: 2D grids with squares/patterns (not 3D, lines, etc.)
+        is_grid = is_counting and any(w in q_lower for w in ["square", "pattern"]) and not any(w in q_lower for w in ["3d", "block", "cube", "line", "pass through", "point"])
+
+        if is_grid:
+            # Grid transcription: model marks grid cells, Python counts
+            grid_prompt = f"""Look at this image carefully. The question is: {question}
 
 Your task: Transcribe the image as a grid/matrix. For EACH element in the image, write 'X' if it matches what needs to be counted, or '.' if it doesn't.
 
@@ -141,114 +152,71 @@ X X . . X
 
 Be very precise — examine each cell/element carefully."""
 
-        grid_response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": [img_url, {"type": "text", "text": grid_prompt}]}],
-            temperature=0,
-            max_completion_tokens=2048,
-        )
-        grid_text = grid_response.choices[0].message.content.strip()
+            grid_text = api_call(client, model, [{"role": "user", "content": [img_url, {"type": "text", "text": grid_prompt}]}], temperature=0, max_tokens=2048)
+            grid_count = grid_text.count('X') if grid_text else 0
 
-        # Count X's programmatically
-        programmatic_count = count_from_grid(grid_text)
-
-        # Also get the baseline answer for comparison
-        prompt_a = f"""Question: {question}
-
-Image analysis notes:
-{description}
-
-Look at the image carefully. Think step by step. Give your final answer in the exact format requested. Put ONLY the answer value on the last line."""
-
-        resp_a = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": [img_url, {"type": "text", "text": prompt_a}]}],
-            temperature=0.1,
-            max_completion_tokens=1024,
-        )
-        answer_a = extract_answer(resp_a.choices[0].message.content.strip(), ans_type)
-
-        # Use programmatic count if reasonable, else fall back to baseline
-        try:
-            prog_num = int(str(programmatic_count))
-            base_num = int(answer_a) if answer_a.isdigit() else 0
-            # If both are in a reasonable range, prefer programmatic
-            if prog_num > 0:
-                answer = str(prog_num)
+            if grid_count > 0:
+                answer = str(grid_count)
             else:
-                answer = answer_a
-        except (ValueError, TypeError):
-            answer = answer_a
+                # Fallback to baseline
+                resp_a = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": [hi_url, {"type": "text", "text": prompt_a}]}],
+                    temperature=0.1,
+                    max_completion_tokens=1024,
+                )
+                answer = extract_answer(resp_a.choices[0].message.content.strip(), ans_type)
+            raw_output = f"GRID_COUNT={grid_count} PICKED={answer}\n---\n{grid_text}"
 
-        raw_output = f"GRID_COUNT={programmatic_count} BASELINE={answer_a} PICKED={answer}\n---\n{grid_text}"
+        elif is_counting:
+            # Non-grid counting: combine multi-turn analysis + direct prompts, majority vote
+            all_answers = []
 
-    elif is_counting_question(question):
-        # Non-grid counting: enumerate-then-count approach
-        enum_prompt = f"""{question}
+            # Approach 1: Multi-turn systematic counting (3 samples)
+            count_msgs = [
+                {"role": "user", "content": [
+                    img_url,
+                    {"type": "text", "text": f"Look at this image carefully.\n\n{question}\n\nFirst, systematically locate and list each item you need to count, with its position (e.g., row and column). Be thorough — scan every row and column."},
+                ]},
+            ]
+            analysis = api_call(client, model, count_msgs, temperature=0, max_tokens=1024)
+            count_msgs.append({"role": "assistant", "content": analysis})
+            count_msgs.append({"role": "user", "content": "Now count your list carefully and give the total. Put ONLY the number on the last line."})
 
-IMPORTANT: Do NOT just give a number. Instead, LIST each item you are counting, one per line, with its position/description.
-Format each line as: "N. [description of item and its location]"
-where N is the running number.
-After listing ALL items, write "Total: [number]" on the last line.
-Be very thorough — examine every part of the image carefully."""
+            for _ in range(3):
+                resp = client.chat.completions.create(
+                    model=model, messages=count_msgs, temperature=0.3, max_completion_tokens=256,
+                )
+                all_answers.append(extract_answer(resp.choices[0].message.content.strip(), ans_type))
 
-        enum_response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": [img_url, {"type": "text", "text": enum_prompt}]}],
-            temperature=0,
-            max_completion_tokens=2048,
-        )
-        enum_text = enum_response.choices[0].message.content.strip()
+            # Approach 2: Direct prompts with detail:high (2 samples)
+            resp_a = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": [hi_url, {"type": "text", "text": prompt_a}]}],
+                temperature=0.1,
+                max_completion_tokens=1024,
+            )
+            all_answers.append(extract_answer(resp_a.choices[0].message.content.strip(), ans_type))
 
-        # Count enumerated items by finding numbered lines
-        numbered_lines = re.findall(r'^\s*(\d+)\.\s', enum_text, re.MULTILINE)
-        if numbered_lines:
-            enum_count = max(int(n) for n in numbered_lines)
-        else:
-            enum_count = 0
-
-        # Also get the baseline answer
-        prompt_a = f"""Question: {question}
-
-Image analysis notes:
-{description}
-
-Look at the image carefully. Think step by step. Give your final answer in the exact format requested. Put ONLY the answer value on the last line."""
-
-        resp_a = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": [img_url, {"type": "text", "text": prompt_a}]}],
-            temperature=0.1,
-            max_completion_tokens=1024,
-        )
-        answer_a = extract_answer(resp_a.choices[0].message.content.strip(), ans_type)
-
-        # Use enumeration count if reasonable, else baseline
-        if enum_count > 0:
-            answer = str(enum_count)
-        else:
-            answer = answer_a
-
-        raw_output = f"ENUM_COUNT={enum_count} BASELINE={answer_a} PICKED={answer}\n---\n{enum_text}"
-
-    else:
-        # Other blank questions: proven two-prompt approach
-        prompt_a = f"""Question: {question}
-
-Image analysis notes:
-{description}
-
-Look at the image carefully. Think step by step. Give your final answer in the exact format requested. Put ONLY the answer value on the last line."""
-
-        q_lower = question.lower()
-        if any(w in q_lower for w in ["how many", "count"]):
-            prompt_b = f"""Image description: {description}
+            prompt_count = f"""Image description: {description}
 
 {question}
 
 IMPORTANT: Before giving your count, list each item you're counting with its approximate position (e.g., "row 1: item at col 2, item at col 5"). Then total them up.
 Put ONLY the final count number on the last line."""
+            resp_b = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": [hi_url, {"type": "text", "text": prompt_count}]}],
+                temperature=0.1,
+                max_completion_tokens=1024,
+            )
+            all_answers.append(extract_answer(resp_b.choices[0].message.content.strip(), ans_type))
+
+            counts = Counter(all_answers)
+            answer = counts.most_common(1)[0][0]
+            raw_output = f"samples={all_answers} picked={answer}"
         else:
+            # Non-counting blank: dual prompts, prefer A
             prompt_b = f"""Here is a detailed description of the image:
 {description}
 
@@ -257,28 +225,28 @@ Now answer this question about the image:
 
 Think step by step, then give your final answer in the exact format requested. Put your final answer on the last line, with ONLY the answer value and nothing else."""
 
-        resp_a = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": [img_url, {"type": "text", "text": prompt_a}]}],
-            temperature=0.1,
-            max_completion_tokens=1024,
-        )
-        answer_a = extract_answer(resp_a.choices[0].message.content.strip(), ans_type)
+            resp_a = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": [hi_url, {"type": "text", "text": prompt_a}]}],
+                temperature=0.1,
+                max_completion_tokens=1024,
+            )
+            answer_a = extract_answer(resp_a.choices[0].message.content.strip(), ans_type)
 
-        resp_b = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": [img_url, {"type": "text", "text": prompt_b}]}],
-            temperature=0.1,
-            max_completion_tokens=1024,
-        )
-        answer_b = extract_answer(resp_b.choices[0].message.content.strip(), ans_type)
+            resp_b = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": [hi_url, {"type": "text", "text": prompt_b}]}],
+                temperature=0.1,
+                max_completion_tokens=1024,
+            )
+            answer_b = extract_answer(resp_b.choices[0].message.content.strip(), ans_type)
 
-        if answer_a == answer_b:
-            answer = answer_a
-            raw_output = resp_a.choices[0].message.content.strip()
-        else:
-            answer = answer_a
-            raw_output = f"A={answer_a} B={answer_b} PICKED=A"
+            if answer_a == answer_b:
+                answer = answer_a
+                raw_output = resp_a.choices[0].message.content.strip()
+            else:
+                answer = answer_a
+                raw_output = f"A={answer_a} B={answer_b} PICKED=A"
 
     # Save trajectory
     traj_dir = os.environ.get("EVAL_TRAJECTORY_DIR")
@@ -288,6 +256,7 @@ Think step by step, then give your final answer in the exact format requested. P
         trajectory = {
             "index": int(idx),
             "model": model,
+            "description": description,
             "question": question,
             "image_path": image_path,
             "ans_type": ans_type,
